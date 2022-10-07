@@ -4,4 +4,4 @@ This crate wraps `std::process::Command`, providing an easier mechanism for hand
 
 ## More information
 
-See [the docs](https://docs.rs/crates/shell-candy) for more detailed information and example usage.
+See [the docs](https://docs.rs/shell-candy) for more detailed information and example usage.
