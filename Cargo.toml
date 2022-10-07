@@ -6,7 +6,7 @@ authors = ["Avery Harnish <rust@averyharnish.com>"]
 categories = ["command-line-util"]
 license = "MIT"
 repository = "https://github.com/EverlastingBugstopper/shell-candy"
-keywords = ["command", "task", "background", "log", "shell", "candy", "posix"]
+keywords = ["command", "task", "log", "shell", "posix"]
 description = """
 🍬 shell-candy wraps std::process::Command, providing a more straightforward mechanism for handling individual log lines.
 """
