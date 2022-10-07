@@ -1,0 +1,19 @@
+[package]
+name = "shell-candy"
+version = "0.1.0"
+edition = "2021"
+authors = ["Avery Harnish <rust@averyharnish.com>"]
+categories = ["command-line-util"]
+license = "MIT"
+license-file = "LICENSE"
+repository = "https://github.com/EverlastingBugstopper/shell-candy"
+keywords = ["command", "task", "background", "log", "shell", "candy", "posix"]
+description = """
+shell-candy wraps std::process::Command and provides an easy mechanism to handle individual log lines
+"""
+
+[dependencies]
+crossbeam-channel = "0.5"
+rayon = "1"
+thiserror = "1"
+which = "4"
