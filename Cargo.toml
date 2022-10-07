@@ -9,7 +9,7 @@ license-file = "LICENSE"
 repository = "https://github.com/EverlastingBugstopper/shell-candy"
 keywords = ["command", "task", "background", "log", "shell", "candy", "posix"]
 description = """
-shell-candy wraps std::process::Command and provides an easy mechanism to handle individual log lines
+🍬 shell-candy wraps std::process::Command, providing a more straightforward mechanism for handling individual log lines.
 """
 
 [dependencies]
