@@ -24,8 +24,8 @@ type UserDefinedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// The result that can be returned by log handlers when running tasks.
 type UserDefinedResult<T> = std::result::Result<T, UserDefinedError>;
 
-/// [`TaskLogResult`] allows you to terminate a process
-/// early or to continue inside your log handler.
+/// [`ShellTaskBehavior`] allows you to terminate a process
+/// early, or to continue inside your log handler.
 pub enum ShellTaskBehavior<T> {
     /// When a log handler returns this variant after processing a log line,
     /// the underlying process is terminated and the underlying [`Result`] is returned.
@@ -80,7 +80,54 @@ impl ShellTask {
     /// Run a [`ShellTask`], applying the log handler to each line.
     ///
     /// You can make the task terminate early if your `log_handler`
-    /// returns [`TaskLogResult::EarlyReturn<T>`].
+    /// returns [`ShellTaskBehavior::EarlyReturn<T>`]. When this variant
+    /// is returned from a log handler, [`ShellTask::run`] will return [`Some<T>`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::anyhow;
+    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskBehavior};
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    ///     let result: Option<String> = ShellTask::new("rustc --version")?.run(|line| {
+    ///         match line {
+    ///             ShellTaskLog::Stderr(_) => {
+    ///                 ShellTaskBehavior::Passthrough
+    ///             },
+    ///             ShellTaskLog::Stdout(message) => {
+    ///                 eprintln!("{}", &message);
+    ///                 ShellTaskBehavior::EarlyReturn(Ok(message))
+    ///             }
+    ///         }
+    ///     })?;
+    ///     assert!(result.is_some());
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// If your `log_handler` returns [`ShellTaskBehavior::Passthrough`] for
+    /// the entire lifecycle of the task, [`ShellTask::run`] will return [`None`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use anyhow::anyhow;
+    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskBehavior};
+    ///
+    /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    ///     let result: Option<()> = ShellTask::new("rustc --version")?.run(|line| {
+    ///         match line {
+    ///             ShellTaskLog::Stderr(message) | ShellTaskLog::Stdout(message) => {
+    ///                 eprintln!("info: {}", &message);
+    ///                 ShellTaskBehavior::Passthrough
+    ///             }
+    ///         }
+    ///     })?;
+    ///     assert!(result.is_none());
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn run<F, T>(&self, log_handler: F) -> Result<Option<T>>
     where
         F: Fn(ShellTaskLog) -> ShellTaskBehavior<T> + Send + Sync + 'static,
