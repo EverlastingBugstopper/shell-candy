@@ -5,61 +5,54 @@ use std::{
     time::Duration,
 };
 
+use crate::{Error, Result, ShellTaskLog};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-
-use crate::{Error, FnTaskLogHandler, Result, ShellTaskLog};
 
 /// A [`ShellTask`] runs commands and provides a passthrough log handler
 /// for each log line.
-/// # Examples
-///
-/// ```
-/// use shell_candy::{Result, ShellTaskLog, ShellTask};
-///
-/// fn main() -> Result<()> {
-///   // Create a task to check the current version of `rustc` that is installed
-///   let task = ShellTask::new("rustc --version", |line| {
-///     match line {
-///       // print all log lines with an "info: " prefix
-///       ShellTaskLog::Stderr(message) | ShellTaskLog::Stdout(message) => eprintln!("info: {}", &message),
-///     }
-///   })?;
-///
-///   // Run the task
-///   task.run()?;
-///
-///   Ok(())
-/// }
-/// ```
 pub struct ShellTask {
     bin: String,
     args: Vec<String>,
     full_command: String,
     log_sender: Sender<ShellTaskLog>,
     log_receiver: Receiver<ShellTaskLog>,
-    log_handler: Arc<FnTaskLogHandler>,
+}
+
+/// The type of error that can be returned by log handlers when running tasks.
+type UserDefinedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// The result that can be returned by log handlers when running tasks.
+type UserDefinedResult<T> = std::result::Result<T, UserDefinedError>;
+
+/// [`TaskLogResult`] allows you to terminate a process
+/// early or to continue inside your log handler.
+pub enum ShellTaskBehavior<T> {
+    /// When a log handler returns this variant after processing a log line,
+    /// the underlying process is terminated and the underlying [`Result`] is returned.
+    EarlyReturn(UserDefinedResult<T>),
+
+    /// When a log handler returns this variant after processing a log line,
+    /// the process is allowed to continue.
+    Passthrough,
 }
 
 impl ShellTask {
     /// Create a new [`ShellTask`] with a log line handler.
-    pub fn new<F>(command: &str, log_handler: F) -> Result<Self>
-    where
-        F: Fn(ShellTaskLog) + Send + Sync + 'static,
-    {
+    pub fn new(command: &str) -> Result<Self> {
         let command = command.to_string();
         let args: Vec<&str> = command.split(' ').collect();
         let (bin, args) = match args.len() {
-            0 => Err(Error::InvalidCommand {
-                command: command.to_string(),
-                reason: "it is not a valid command".to_string(),
+            0 => Err(Error::InvalidTask {
+                task: command.to_string(),
+                reason: "an empty string is not a command".to_string(),
             }),
             1 => Ok((args[0], Vec::new())),
             _ => Ok((args[0], Vec::from_iter(args[1..].iter()))),
         }?;
 
         if which::which(bin).is_err() {
-            Err(Error::InvalidCommand {
-                command: command.to_string(),
+            Err(Error::InvalidTask {
+                task: command.to_string(),
                 reason: format!("'{}' is not installed on this machine", &bin),
             })
         } else {
@@ -70,26 +63,51 @@ impl ShellTask {
                 full_command: command,
                 log_sender,
                 log_receiver,
-                log_handler: Arc::new(Box::new(log_handler)),
             })
         }
     }
 
-    /// Run a [`ShellTask`], applying the log handler to each line.
-    pub fn run(&self) -> Result<()> {
-        let log_counter: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
+    /// Returns the full command that was used to instantiate this [`ShellTask`].
+    pub fn descriptor(&self) -> String {
+        self.full_command.to_string()
+    }
 
+    /// Returns the [`ShellTask::descriptor`] with the classic `$` shell prefix.
+    pub fn bash_descriptor(&self) -> String {
+        format!("$ {}", self.descriptor())
+    }
+
+    /// Run a [`ShellTask`], applying the log handler to each line.
+    ///
+    /// You can make the task terminate early if your `log_handler`
+    /// returns [`TaskLogResult::EarlyReturn<T>`].
+    pub fn run<F, T>(&self, log_handler: F) -> Result<Option<T>>
+    where
+        F: Fn(ShellTaskLog) -> ShellTaskBehavior<T> + Send + Sync + 'static,
+        T: Send + Sync + 'static,
+    {
+        let log_counter: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
         let log_decrementer = log_counter.clone();
         let log_incrementer = log_counter.clone();
-        let log_handler = self.log_handler.clone();
         let log_receiver = self.log_receiver.clone();
 
+        let maybe_result = Arc::new(Mutex::new(None));
+        let early_terminator = maybe_result.clone();
         rayon::spawn(move || loop {
             match log_receiver.recv() {
                 Ok(line) => {
-                    (log_handler)(line);
                     if let Some(count) = log_decrementer.clone().lock().unwrap().as_mut() {
                         *count -= 1;
+                    }
+                    match (log_handler)(line) {
+                        ShellTaskBehavior::EarlyReturn(early_return) => {
+                            let mut maybe_result = early_terminator.lock().unwrap();
+                            if maybe_result.is_none() {
+                                *maybe_result = Some(early_return);
+                                break;
+                            }
+                        }
+                        ShellTaskBehavior::Passthrough => continue,
                     }
                 }
                 Err(_) => break,
@@ -105,10 +123,11 @@ impl ShellTask {
         )?;
 
         let exit_status = task.child.wait().map_err(|source| Error::CouldNotWait {
-            command: self.full_command.to_string(),
+            task: self.full_command.to_string(),
             source,
         })?;
 
+        // wait until the log counter reaches 0 so we know they've all been processed
         loop {
             std::thread::sleep(Duration::from_millis(200));
             match log_counter.try_lock().map(|l| *l) {
@@ -118,10 +137,14 @@ impl ShellTask {
         }
 
         if exit_status.success() {
-            Ok(())
+            if let Some(result) = maybe_result.clone().lock().unwrap().take() {
+                result.map(|t| Some(t)).map_err(|e| e.into())
+            } else {
+                Ok(None)
+            }
         } else {
-            Err(Error::CommandFailure {
-                command: self.full_command.to_string(),
+            Err(Error::TaskFailure {
+                task: self.full_command.to_string(),
                 exit_status,
             })
         }
@@ -148,7 +171,7 @@ impl ShellTaskRunner {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = command.spawn().map_err(|source| Error::CouldNotSpawn {
-            command: full_command,
+            task: full_command,
             source,
         })?;
 
