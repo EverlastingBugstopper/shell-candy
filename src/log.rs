@@ -2,7 +2,7 @@
 use crate::ShellTask;
 
 /// A log message emitted by a [`ShellTask`].
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ShellTaskLog {
     /// A log message emitted to `stdout`
     Stdout(String),
