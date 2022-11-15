@@ -48,11 +48,25 @@ pub enum Error {
         /// The task that could not be waited for.
         task: String,
 
-        /// /The [`io::Error`] that was reported by [`std::process::Child::wait`].
+        /// The [`io::Error`] that was reported by [`std::process::Child::wait`].
+        source: io::Error,
+    },
+
+    /// This error is returned when the current directory cannot be found. Originates from [`std::env::current_dir`].
+    #[error("could not find current directory when initializing task: {source}.")]
+    CouldNotFindCurrentDirectory {
+        /// The [`io::Error`] that was reported by [`std::env::current_dir`].
         source: io::Error,
     },
 
     /// This error can be returned from log handlers to terminate early.
     #[error(transparent)]
     EarlyReturn(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
+
+    /// This error is returned when the log lock is poisoned.
+    #[error("encountered an unrecoverable error while processing logs for '{task}'.")]
+    PoisonedLog {
+        /// The task that encountered an unrecoverable error
+        task: String,
+    },
 }
