@@ -19,7 +19,7 @@ impl ShellTaskRunner {
         command: Command,
         command_string: String,
         log_sender: Sender<ShellTaskLog>,
-        log_incrementer: Arc<Mutex<Option<usize>>>,
+        log_incrementer: Arc<Mutex<Vec<ShellTaskLog>>>,
     ) -> Result<Self> {
         let mut command = command;
         command.env("SHELL_CANDY", "true");
@@ -42,14 +42,7 @@ impl ShellTaskRunner {
                         let guard = stdout_incrementer.clone();
 
                         match guard.lock() {
-                            Ok(mut guard) => match guard.as_mut() {
-                                Some(s) => {
-                                    *s += 1;
-                                }
-                                None => {
-                                    *guard = Some(1);
-                                }
-                            },
+                            Ok(mut guard) => guard.push(ShellTaskLog::Stdout(line.to_string())),
                             Err(e) => panic!("{}", e),
                         }
 
@@ -69,14 +62,7 @@ impl ShellTaskRunner {
                         let guard = stderr_incrementer.clone();
 
                         match guard.lock() {
-                            Ok(mut guard) => match guard.as_mut() {
-                                Some(s) => {
-                                    *s += 1;
-                                }
-                                None => {
-                                    *guard = Some(1);
-                                }
-                            },
+                            Ok(mut guard) => guard.push(ShellTaskLog::Stderr(line.to_string())),
                             Err(e) => panic!("{}", e),
                         }
 

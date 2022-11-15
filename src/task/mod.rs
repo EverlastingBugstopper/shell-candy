@@ -12,9 +12,11 @@ use crate::{Error, Result, ShellTaskLog};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 mod behavior;
+mod output;
 mod runner;
 
 pub use behavior::ShellTaskBehavior;
+pub use output::ShellTaskOutput;
 use runner::ShellTaskRunner;
 
 /// A [`ShellTask`] runs commands and provides a passthrough log handler
@@ -114,10 +116,10 @@ impl ShellTask {
     ///
     /// ```
     /// use anyhow::anyhow;
-    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskBehavior};
+    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskOutput, ShellTaskBehavior};
     ///
     /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    ///     let result: Option<String> = ShellTask::new("rustc --version")?.run(|line| {
+    ///     let result = ShellTask::new("rustc --version")?.run(|line| {
     ///         match line {
     ///             ShellTaskLog::Stderr(_) => {
     ///                 ShellTaskBehavior::Passthrough
@@ -128,51 +130,78 @@ impl ShellTask {
     ///             }
     ///         }
     ///     })?;
-    ///     assert!(result.is_some());
+    ///     assert!(matches!(result, ShellTaskOutput::EarlyReturn { .. }));
     ///     Ok(())
     /// }
     /// ```
     ///
     /// If your `log_handler` returns [`ShellTaskBehavior::Passthrough`] for
-    /// the entire lifecycle of the task, [`ShellTask::run`] will return [`None`].
+    /// the entire lifecycle of the task, [`ShellTask::run`] will return [`ShellTaskOutput::CompleteOutput`].
     ///
     /// # Example
     ///
     /// ```
     /// use anyhow::anyhow;
-    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskBehavior};
+    /// use shell_candy::{ShellTask, ShellTaskLog, ShellTaskOutput, ShellTaskBehavior};
     ///
     /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    ///     let result: Option<()> = ShellTask::new("rustc --version")?.run(|line| {
+    ///     let result = ShellTask::new("rustc --version")?.run(|line| {
     ///         match line {
     ///             ShellTaskLog::Stderr(message) | ShellTaskLog::Stdout(message) => {
     ///                 eprintln!("info: {}", &message);
-    ///                 ShellTaskBehavior::Passthrough
+    ///                 ShellTaskBehavior::<()>::Passthrough
     ///             }
     ///         }
     ///     })?;
-    ///     assert!(result.is_none());
+    ///     assert!(matches!(result, ShellTaskOutput::CompleteOutput { .. }));
     ///     Ok(())
     /// }
     /// ```
-    pub fn run<F, T>(&self, log_handler: F) -> Result<Option<T>>
+    pub fn run<F, T>(&self, log_handler: F) -> Result<ShellTaskOutput<T>>
     where
         F: Fn(ShellTaskLog) -> ShellTaskBehavior<T> + Send + Sync + 'static,
         T: Send + Sync + 'static,
     {
-        let log_counter: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
-        let log_decrementer = log_counter.clone();
-        let log_incrementer = log_counter.clone();
+        let log_drain: Arc<Mutex<Vec<ShellTaskLog>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_drainer = log_drain.clone();
+        let log_drain_filler = log_drain.clone();
         let log_receiver = self.log_receiver.clone();
         let full_command = self.full_command.to_string();
 
         let maybe_result = Arc::new(Mutex::new(None));
         let early_terminator = maybe_result.clone();
+
+        let collected_stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let collected_stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let stdout_collector = collected_stdout_lines.clone();
+        let stderr_collector = collected_stderr_lines.clone();
+
         rayon::spawn(move || {
             while let Ok(line) = log_receiver.recv() {
-                if let Ok(mut log_decrementer) = log_decrementer.clone().lock() {
-                    if let Some(count) = log_decrementer.as_mut() {
-                        *count -= 1;
+                match &line {
+                    ShellTaskLog::Stderr(stderr) => {
+                        if let Ok(mut stderr_lines) = stderr_collector.clone().lock() {
+                            stderr_lines.push(stderr.to_string())
+                        }
+                    }
+                    ShellTaskLog::Stdout(stdout) => {
+                        if let Ok(mut stdout_lines) = stdout_collector.clone().lock() {
+                            stdout_lines.push(stdout.to_string())
+                        }
+                    }
+                }
+
+                if let Ok(mut log_decrementer) = log_drainer.clone().lock() {
+                    if let Some(stderr_pos) = log_decrementer
+                        .iter()
+                        .position(|e| matches!(e, ShellTaskLog::Stderr(_)))
+                    {
+                        log_decrementer.remove(stderr_pos);
+                    } else if let Some(stdout_pos) = log_decrementer
+                        .iter()
+                        .position(|e| matches!(e, ShellTaskLog::Stdout(_)))
+                    {
+                        log_decrementer.remove(stdout_pos);
                     }
                     match (log_handler)(line) {
                         ShellTaskBehavior::EarlyReturn(early_return) => {
@@ -197,37 +226,58 @@ impl ShellTask {
             }
         });
 
-        let mut task = ShellTaskRunner::run(
+        let task = ShellTaskRunner::run(
             self.get_command(),
             self.full_command.to_string(),
             self.log_sender.clone(),
-            log_incrementer,
+            log_drain_filler,
         )?;
 
-        let exit_status = task.child.wait().map_err(|source| Error::CouldNotWait {
-            task: self.full_command.to_string(),
-            source,
-        })?;
+        let output = task
+            .child
+            .wait_with_output()
+            .map_err(|source| Error::CouldNotWait {
+                task: self.full_command.to_string(),
+                source,
+            })?;
 
-        // wait until the log counter reaches 0 so we know they've all been processed
+        // wait until the log drain is empty so we know they've all been processed
         loop {
             std::thread::sleep(Duration::from_millis(200));
-            match log_counter.try_lock().map(|l| *l) {
-                Ok(Some(0)) => break,
+            match log_drain.try_lock() {
+                Ok(log_drain) => {
+                    if log_drain.is_empty() {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
                 _ => continue,
             }
         }
 
-        if exit_status.success() {
+        if output.status.success() {
+            let collected_stderr_lines = collected_stderr_lines.lock().unwrap().to_vec();
+            let collected_stdout_lines = collected_stdout_lines.lock().unwrap().to_vec();
             if let Some(result) = maybe_result.clone().lock().unwrap().take() {
-                result.map(|t| Some(t)).map_err(|e| e.into())
+                result
+                    .map(|t| ShellTaskOutput::EarlyReturn {
+                        stderr_lines: collected_stderr_lines,
+                        stdout_lines: collected_stdout_lines,
+                        return_value: t,
+                    })
+                    .map_err(|e| e.into())
             } else {
-                Ok(None)
+                Ok(ShellTaskOutput::CompleteOutput {
+                    status: output.status,
+                    stdout_lines: collected_stdout_lines,
+                    stderr_lines: collected_stderr_lines,
+                })
             }
         } else {
             Err(Error::TaskFailure {
                 task: self.full_command.to_string(),
-                exit_status,
+                exit_status: output.status,
             })
         }
     }
